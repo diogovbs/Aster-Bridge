@@ -145,6 +145,7 @@ pub async fn run(
     tracing::info!("SMTP server listening on {} (STARTTLS={})", addr, tls_config.is_some());
 
     let mut acceptor = crate::accept::ResilientAcceptor::new("SMTP");
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         let (stream, peer) = acceptor.accept(&listener).await;
         if !peer.ip().is_loopback() {
@@ -168,7 +169,8 @@ pub async fn run(
         let db = db.clone();
         let tls_config = tls_config.clone();
 
-        tokio::spawn(async move {
+        while connections.try_join_next().is_some() {}
+        connections.spawn(async move {
             let _permit = permit;
             if let Err(e) = handle_session(stream, session, client, passwords, db, tls_config, true).await {
                 tracing::error!("SMTP connection error: {}", e);
@@ -191,6 +193,7 @@ pub async fn run_implicit_tls(
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
 
     let mut conn_acceptor = crate::accept::ResilientAcceptor::new("SMTPS");
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         let (stream, peer) = conn_acceptor.accept(&listener).await;
         if !peer.ip().is_loopback() {
@@ -212,7 +215,8 @@ pub async fn run_implicit_tls(
         let db = db.clone();
         let acceptor = acceptor.clone();
 
-        tokio::spawn(async move {
+        while connections.try_join_next().is_some() {}
+        connections.spawn(async move {
             let _permit = permit;
             let tls_stream = match crate::tls::accept_with_timeout(&acceptor, stream, "SMTPS").await {
                 Some(s) => s,

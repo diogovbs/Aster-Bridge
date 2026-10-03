@@ -69,9 +69,78 @@ impl ResilientAcceptor {
     }
 }
 
+pub enum CloseConnectionsOnDrop {
+    Graceful(tokio::sync::watch::Sender<()>),
+    Immediate(axum_server::Handle),
+}
+
+impl CloseConnectionsOnDrop {
+    pub fn for_axum() -> (Self, impl std::future::Future<Output = ()> + Send + 'static) {
+        let (signal, mut dropped) = tokio::sync::watch::channel(());
+        let closed = async move {
+            let _ = dropped.changed().await;
+        };
+        (Self::Graceful(signal), closed)
+    }
+
+    pub fn for_axum_server() -> (Self, axum_server::Handle) {
+        let handle = axum_server::Handle::new();
+        (Self::Immediate(handle.clone()), handle)
+    }
+}
+
+impl Drop for CloseConnectionsOnDrop {
+    fn drop(&mut self) {
+        if let Self::Immediate(handle) = self {
+            handle.shutdown();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn read_to_close(stream: &mut TcpStream) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 1024];
+        let wait = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => continue,
+                }
+            }
+        });
+        wait.await.is_ok()
+    }
+
+    #[tokio::test]
+    async fn dropping_the_axum_server_closes_keep_alive_connections() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let server = tokio::spawn(async move {
+            let (_close_connections, closed) = CloseConnectionsOnDrop::for_axum();
+            let _ = axum::serve(listener, app).with_graceful_shutdown(closed).await;
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+
+        server.abort();
+        assert!(
+            read_to_close(&mut stream).await,
+            "a keep-alive connection outlived the server that accepted it"
+        );
+    }
 
     #[test]
     fn the_first_few_accept_errors_retry_without_delay() {

@@ -69,7 +69,10 @@ pub async fn run(
         );
         tracing::info!("JMAP server listening on https://{}", sock_addr);
         let rustls_cfg = axum_server::tls_rustls::RustlsConfig::from_config(cfg);
+        let (_close_connections, handle) =
+            crate::accept::CloseConnectionsOnDrop::for_axum_server();
         return axum_server::bind_rustls(sock_addr, rustls_cfg)
+            .handle(handle)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
             .map_err(|e| e.to_string());
@@ -103,10 +106,12 @@ pub async fn serve(
 
     tracing::info!("JMAP server listening on http://{}", sock_addr);
 
+    let (_close_connections, closed) = crate::accept::CloseConnectionsOnDrop::for_axum();
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(closed)
     .await
     .map_err(|e| e.to_string())
 }

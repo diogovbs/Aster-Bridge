@@ -973,6 +973,7 @@ pub async fn serve(
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<()> {
     let mut acceptor = crate::accept::ResilientAcceptor::new("IMAP");
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         let (stream, peer) = acceptor.accept(&listener).await;
         if !peer.ip().is_loopback() {
@@ -997,7 +998,8 @@ pub async fn serve(
         let broadcaster = broadcaster.clone();
         let tls_config = tls_config.clone();
 
-        tokio::spawn(async move {
+        while connections.try_join_next().is_some() {}
+        connections.spawn(async move {
             let _permit = permit;
             if let Err(e) = run_session(
                 stream, session, db, client, passwords, broadcaster, tls_config,
@@ -1025,6 +1027,7 @@ pub async fn run_implicit_tls(
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
 
     let mut conn_acceptor = crate::accept::ResilientAcceptor::new("IMAPS");
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         let (stream, peer) = conn_acceptor.accept(&listener).await;
         if !peer.ip().is_loopback() {
@@ -1047,7 +1050,8 @@ pub async fn run_implicit_tls(
         let broadcaster = broadcaster.clone();
         let acceptor = acceptor.clone();
 
-        tokio::spawn(async move {
+        while connections.try_join_next().is_some() {}
+        connections.spawn(async move {
             let _permit = permit;
             let tls_stream = match crate::tls::accept_with_timeout(&acceptor, stream, "IMAPS").await {
                 Some(s) => s,
@@ -4449,6 +4453,17 @@ mod tests {
         broadcast::Sender<StateChange>,
         tempfile::TempDir,
     ) {
+        let (addr, db, tx, dir, _server) = start_test_server_with_handle().await;
+        (addr, db, tx, dir)
+    }
+
+    async fn start_test_server_with_handle() -> (
+        std::net::SocketAddr,
+        Arc<Database>,
+        broadcast::Sender<StateChange>,
+        tempfile::TempDir,
+        tokio::task::JoinHandle<()>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::open_with_key(dir.path(), &[7u8; 32]).unwrap());
         let _ = db.seed_jmap_mailboxes();
@@ -4481,7 +4496,7 @@ mod tests {
 
         let db_clone = db.clone();
         let tx_clone = tx.clone();
-        tokio::spawn(async move {
+        let server = tokio::spawn(async move {
             let _ = serve(listener, session, db_clone, client, passwords, tx_clone, None).await;
         });
 
@@ -4492,7 +4507,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
 
-        (addr, db, tx, dir)
+        (addr, db, tx, dir, server)
     }
 
     async fn read_until_tag(
@@ -4916,6 +4931,19 @@ mod tests {
             selects,
             seen
         );
+    }
+
+    #[tokio::test]
+    async fn stopping_the_listener_closes_open_sessions() {
+        let (addr, _db, _tx, _dir, server) = start_test_server_with_handle().await;
+        let (mut reader, _writer) = login_and_select(addr).await;
+
+        server.abort();
+        let mut line = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .expect("the session kept serving after its listener was stopped");
+        assert_eq!(read.unwrap_or(0), 0, "expected the connection to close, got {:?}", line);
     }
 
     #[tokio::test]

@@ -99,6 +99,7 @@ pub async fn serve_with_tls(
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<()> {
     let mut acceptor = crate::accept::ResilientAcceptor::new("POP3");
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         let (stream, peer) = acceptor.accept(&listener).await;
         if !peer.ip().is_loopback() {
@@ -120,7 +121,8 @@ pub async fn serve_with_tls(
         let client = client.clone();
         let tls_config = tls_config.clone();
 
-        tokio::spawn(async move {
+        while connections.try_join_next().is_some() {}
+        connections.spawn(async move {
             let _permit = permit;
             if let Err(e) = run_session(stream, session, db, client, passwords, tls_config).await {
                 tracing::error!("POP3 connection error: {}", e);
@@ -143,6 +145,7 @@ pub async fn run_implicit_tls(
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
 
     let mut conn_acceptor = crate::accept::ResilientAcceptor::new("POP3S");
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         let (stream, peer) = conn_acceptor.accept(&listener).await;
         if !peer.ip().is_loopback() {
@@ -164,7 +167,8 @@ pub async fn run_implicit_tls(
         let client = client.clone();
         let acceptor = acceptor.clone();
 
-        tokio::spawn(async move {
+        while connections.try_join_next().is_some() {}
+        connections.spawn(async move {
             let _permit = permit;
             let tls_stream = match crate::tls::accept_with_timeout(&acceptor, stream, "POP3S").await {
                 Some(s) => s,
