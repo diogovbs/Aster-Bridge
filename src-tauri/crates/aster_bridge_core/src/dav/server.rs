@@ -562,7 +562,7 @@ async fn propfind_collection(state: DavState, path: String, req: Request) -> Res
                 render_propstats(&props, &addressbook_props(&collection_ctag(&entries))),
             ));
             if depth != "0" {
-                for entry in &entries {
+                for entry in entries.iter() {
                     out.push_str(&response_block(
                         &card_href(&entry.uid),
                         render_propstats(&props, &card_props(entry, props.wants("address-data"))),
@@ -621,7 +621,7 @@ async fn report_addressbook(state: DavState, req: Request) -> Response {
     match report {
         ReportRequest::Query { props } => {
             let mut out = String::new();
-            for entry in &entries {
+            for entry in entries.iter() {
                 out.push_str(&response_block(
                     &card_href(&entry.uid),
                     render_propstats(&props, &card_props(entry, props.wants("address-data"))),
@@ -970,6 +970,7 @@ mod e2e_tests {
     use base64::Engine as _;
     use serde_json::{json, Value};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
     use uuid::Uuid;
@@ -977,10 +978,19 @@ mod e2e_tests {
     type Rows = Arc<StdMutex<HashMap<String, Value>>>;
 
     async fn stub_backend() -> (String, Rows) {
+        let (base, rows, _lists) = stub_backend_counting().await;
+        (base, rows)
+    }
+
+    async fn stub_backend_counting() -> (String, Rows, Arc<AtomicUsize>) {
         let rows: Rows = Arc::new(StdMutex::new(HashMap::new()));
+        let lists = Arc::new(AtomicUsize::new(0));
+        let revisions = Arc::new(AtomicUsize::new(0));
 
         let list_rows = rows.clone();
+        let list_count = lists.clone();
         let create_rows = rows.clone();
+        let get_rows = rows.clone();
         let update_rows = rows.clone();
         let delete_rows = rows.clone();
 
@@ -989,7 +999,9 @@ mod e2e_tests {
                 "/contacts/v1",
                 axum::routing::get(move || {
                     let rows = list_rows.clone();
+                    list_count.fetch_add(1, Ordering::SeqCst);
                     async move {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
                         let items: Vec<Value> =
                             rows.lock().unwrap().values().cloned().collect();
                         axum::Json(json!({
@@ -1015,9 +1027,19 @@ mod e2e_tests {
             )
             .route(
                 "/contacts/v1/:id",
-                axum::routing::put(
+                axum::routing::get(move |Path(id): Path<String>| {
+                    let rows = get_rows.clone();
+                    async move {
+                        match rows.lock().unwrap().get(&id) {
+                            Some(record) => axum::Json(record.clone()).into_response(),
+                            None => StatusCode::NOT_FOUND.into_response(),
+                        }
+                    }
+                })
+                .put(
                     move |Path(id): Path<String>, axum::Json(body): axum::Json<Value>| {
                         let rows = update_rows.clone();
+                        let revision = revisions.fetch_add(1, Ordering::SeqCst) + 1;
                         async move {
                             let mut guard = rows.lock().unwrap();
                             match guard.get_mut(&id) {
@@ -1026,6 +1048,10 @@ mod e2e_tests {
                                     for (key, value) in body.as_object().unwrap() {
                                         target.insert(key.clone(), value.clone());
                                     }
+                                    target.insert(
+                                        "updated_at".to_string(),
+                                        Value::from(format!("2026-08-22T00:00:{:02}Z", revision % 60)),
+                                    );
                                     StatusCode::OK
                                 }
                                 None => StatusCode::NOT_FOUND,
@@ -1049,7 +1075,7 @@ mod e2e_tests {
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        (base, rows)
+        (base, rows, lists)
     }
 
     async fn start_dav() -> (String, String, Rows, tempfile::TempDir) {
@@ -1060,24 +1086,7 @@ mod e2e_tests {
         let passwords = Arc::new(AppPasswords::new(db.clone()));
         let _ = passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
 
-        let session = Arc::new(RwLock::new(Session {
-            data_kek: Some(zeroize::Zeroizing::new(STANDARD.encode([5u8; 32]))),
-            user_id: Uuid::new_v4(),
-            username: "tester".to_string(),
-            email: "tester@aster.test".to_string(),
-            access_token: zeroize::Zeroizing::new("stub".to_string()),
-            refresh_token: None,
-            vault_passphrase: Vec::new(),
-            identity_key: None,
-            ratchet_identity_public: None,
-            ratchet_keys: Vec::new(),
-            inbound_keys: Vec::new(),
-            send_identities: Vec::new(),
-            default_sender_id: None,
-            account_keys: Vec::new(),
-            previous_keys: Default::default(),
-        }));
-
+        let session = kek_session();
         let client = Arc::new(ApiClient::new_with_base_url(&api_base));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1103,6 +1112,101 @@ mod e2e_tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         panic!("carddav test server did not become ready")
+    }
+
+    fn kek_session() -> Arc<RwLock<Session>> {
+        Arc::new(RwLock::new(Session {
+            data_kek: Some(zeroize::Zeroizing::new(STANDARD.encode([5u8; 32]))),
+            user_id: Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+            default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
+        }))
+    }
+
+    async fn counting_store() -> (ContactsStore, Rows, Arc<AtomicUsize>) {
+        let (api_base, rows, lists) = stub_backend_counting().await;
+        let client = Arc::new(ApiClient::new_with_base_url(&api_base));
+        (ContactsStore::new(client, kek_session()), rows, lists)
+    }
+
+    #[tokio::test]
+    async fn put_updates_the_cache_in_place_with_the_listing_etag() {
+        let (store, _rows, lists) = counting_store().await;
+
+        let (created, was_created) = store.put("ada-1", CARD).await.unwrap();
+        assert!(was_created);
+        assert_eq!(lists.load(Ordering::SeqCst), 1);
+
+        let cached = store.get("ada-1").await.unwrap().unwrap();
+        assert_eq!(lists.load(Ordering::SeqCst), 1, "get after put must not refetch");
+        assert_eq!(cached.etag, created.etag);
+        assert_eq!(cached.vcard, created.vcard);
+        assert_eq!(store.list().await.unwrap().len(), 1);
+
+        let edited = CARD.replace("ada@example.com", "ada@work.example");
+        let (updated, was_created) = store.put("ada-1", &edited).await.unwrap();
+        assert!(!was_created);
+        assert_ne!(updated.etag, created.etag);
+        let calls = lists.load(Ordering::SeqCst);
+        let cached = store.get("ada-1").await.unwrap().unwrap();
+        assert_eq!(lists.load(Ordering::SeqCst), calls);
+        assert_eq!(cached.etag, updated.etag);
+        assert!(cached.vcard.contains("ada@work.example"));
+
+        store.invalidate().await;
+        let refetched = store.get("ada-1").await.unwrap().unwrap();
+        assert_eq!(refetched.etag, updated.etag);
+        assert_eq!(refetched.vcard, updated.vcard);
+        assert_eq!(refetched.contact_id, updated.contact_id);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_cached_entry_in_place() {
+        let (store, rows, lists) = counting_store().await;
+        store.put("ada-1", CARD).await.unwrap();
+        store
+            .put("bob-2", &CARD.replace("ada-1", "bob-2").replace("Ada Lovelace", "Bob"))
+            .await
+            .unwrap();
+
+        assert!(store.delete("ada-1").await.unwrap());
+        assert_eq!(rows.lock().unwrap().len(), 1);
+        let calls = lists.load(Ordering::SeqCst);
+        assert!(store.get("ada-1").await.unwrap().is_none());
+        assert!(store.get("bob-2").await.unwrap().is_some());
+        assert_eq!(store.list().await.unwrap().len(), 1);
+        assert_eq!(lists.load(Ordering::SeqCst), calls, "reads after delete must not refetch");
+
+        assert!(!store.delete("ada-1").await.unwrap());
+        store.invalidate().await;
+        assert!(store.get("ada-1").await.unwrap().is_none());
+        assert_eq!(store.list().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_reads_of_a_stale_cache_share_one_fetch() {
+        let (store, _rows, lists) = counting_store().await;
+        store.put("ada-1", CARD).await.unwrap();
+        store.invalidate().await;
+        let before = lists.load(Ordering::SeqCst);
+
+        let reads = (0..8).map(|_| store.list());
+        let results = futures_util::future::join_all(reads).await;
+        for result in results {
+            assert_eq!(result.unwrap().len(), 1);
+        }
+        assert_eq!(lists.load(Ordering::SeqCst), before + 1);
     }
 
     fn dav_request(

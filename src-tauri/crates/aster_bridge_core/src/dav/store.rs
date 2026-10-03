@@ -26,7 +26,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::api_client::{ApiClient, CreateContactRequest, UpdateContactRequest};
+use crate::api_client::{ApiClient, ContactRecord, CreateContactRequest, UpdateContactRequest};
 use crate::auth::session::Session;
 use crate::crypto::contacts::{ContactsKeys, CONTACT_DATA_VERSION};
 use crate::error::{BridgeError, Result};
@@ -46,14 +46,61 @@ pub struct ContactEntry {
 }
 
 struct CachedListing {
-    entries: Vec<ContactEntry>,
+    entries: Arc<Vec<ContactEntry>>,
+    index: HashMap<String, usize>,
     fetched_at: Instant,
+}
+
+impl CachedListing {
+    fn new(entries: Vec<ContactEntry>, fetched_at: Instant) -> Self {
+        let index = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.uid.clone(), i))
+            .collect();
+        Self {
+            entries: Arc::new(entries),
+            index,
+            fetched_at,
+        }
+    }
+
+    fn find(&self, uid: &str) -> Option<&ContactEntry> {
+        self.index.get(uid).map(|&i| &self.entries[i])
+    }
+
+    fn upsert(&mut self, entry: ContactEntry) {
+        let entries = Arc::make_mut(&mut self.entries);
+        match self.index.get(&entry.uid) {
+            Some(&i) => entries[i] = entry,
+            None => {
+                self.index.insert(entry.uid.clone(), entries.len());
+                entries.push(entry);
+            }
+        }
+    }
+
+    fn remove(&mut self, uid: &str) {
+        let Some(i) = self.index.remove(uid) else {
+            return;
+        };
+        let entries = Arc::make_mut(&mut self.entries);
+        entries.swap_remove(i);
+        if let Some(moved) = entries.get(i) {
+            self.index.insert(moved.uid.clone(), i);
+        }
+    }
 }
 
 pub struct ContactsStore {
     client: Arc<ApiClient>,
     session: Arc<RwLock<Session>>,
     cache: RwLock<Option<CachedListing>>,
+    // Held while the listing is fetched from the server, so concurrent
+    // readers that find the cache stale wait for one fetch instead of each
+    // starting their own. Writers hold it for the whole write so a refresh
+    // that started before the write can't overwrite the updated cache.
+    refresh_lock: Mutex<()>,
     write_lock: Mutex<()>,
 }
 
@@ -89,6 +136,7 @@ impl ContactsStore {
             client,
             session,
             cache: RwLock::new(None),
+            refresh_lock: Mutex::new(()),
             write_lock: Mutex::new(()),
         }
     }
@@ -123,49 +171,11 @@ impl ContactsStore {
                 .await?;
 
             for record in &page.items {
-                if let (Some(hash), Some(version)) =
-                    (record.integrity_hash.as_deref(), record.data_version)
-                {
-                    if !keys.verify_integrity_hash(
-                        &record.encrypted_data,
-                        &record.data_nonce,
-                        version,
-                        hash,
-                    ) {
-                        skipped_integrity += 1;
-                        tracing::debug!(
-                            "contact {} failed its integrity check and was skipped",
-                            record.id
-                        );
-                        continue;
-                    }
+                match record_to_entry(&keys, record) {
+                    Ok(entry) => entries.push(entry),
+                    Err(RecordSkip::Integrity) => skipped_integrity += 1,
+                    Err(RecordSkip::Decrypt) => skipped_decrypt += 1,
                 }
-
-                let payload = match keys.decrypt_data(&record.encrypted_data, &record.data_nonce) {
-                    Ok(payload) => payload,
-                    Err(e) => {
-                        skipped_decrypt += 1;
-                        tracing::debug!("contact {} could not be decrypted: {}", record.id, e);
-                        continue;
-                    }
-                };
-
-                let uid = payload
-                    .get(DAV_UID_FIELD)
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.trim())
-                    .filter(|v| !v.is_empty() && is_safe_uid(v))
-                    .unwrap_or(record.id.as_str())
-                    .to_string();
-
-                let vcard =
-                    super::vcard::contact_to_vcard(&uid, &payload, &record.updated_at);
-                entries.push(ContactEntry {
-                    uid,
-                    contact_id: record.id.clone(),
-                    etag: entry_etag(&vcard),
-                    vcard,
-                });
             }
 
             match page.next_cursor {
@@ -193,24 +203,76 @@ impl ContactsStore {
         *self.cache.write().await = None;
     }
 
-    pub async fn list(&self) -> Result<Vec<ContactEntry>> {
-        if let Some(cached) = self.cache.read().await.as_ref() {
-            if cached.fetched_at.elapsed() < CACHE_TTL {
-                return Ok(cached.entries.clone());
-            }
-        }
+    async fn fresh_cached<R>(&self, f: impl FnOnce(&CachedListing) -> R) -> Option<R> {
+        let cache = self.cache.read().await;
+        cache
+            .as_ref()
+            .filter(|cached| cached.fetched_at.elapsed() < CACHE_TTL)
+            .map(f)
+    }
 
+    // Fetches the whole address book and stores it as the cache. The caller
+    // must hold refresh_lock.
+    async fn refresh_locked(&self) -> Result<()> {
+        let fetched_at = Instant::now();
         let entries = self.fetch_entries().await?;
-        *self.cache.write().await = Some(CachedListing {
-            entries: entries.clone(),
-            fetched_at: Instant::now(),
-        });
+        *self.cache.write().await = Some(CachedListing::new(entries, fetched_at));
+        Ok(())
+    }
 
-        Ok(entries)
+    async fn with_listing<R>(&self, f: impl Fn(&CachedListing) -> R) -> Result<R> {
+        if let Some(out) = self.fresh_cached(&f).await {
+            return Ok(out);
+        }
+        let _refresh = self.refresh_lock.lock().await;
+        if let Some(out) = self.fresh_cached(&f).await {
+            return Ok(out);
+        }
+        self.refresh_locked().await?;
+        let cache = self.cache.read().await;
+        let cached = cache
+            .as_ref()
+            .ok_or_else(|| BridgeError::Api("contacts listing unavailable".to_string()))?;
+        Ok(f(cached))
+    }
+
+    pub async fn list(&self) -> Result<Arc<Vec<ContactEntry>>> {
+        self.with_listing(|cached| cached.entries.clone()).await
     }
 
     pub async fn get(&self, uid: &str) -> Result<Option<ContactEntry>> {
-        Ok(self.list().await?.into_iter().find(|e| e.uid == uid))
+        self.with_listing(|cached| cached.find(uid).cloned()).await
+    }
+
+    // Refreshes the listing from the server and returns the current entry for
+    // uid. Writers call this with refresh_lock held so the write is decided
+    // against current server state.
+    async fn current_entry_locked(&self, uid: &str) -> Result<Option<ContactEntry>> {
+        self.refresh_locked().await?;
+        Ok(self
+            .cache
+            .read()
+            .await
+            .as_ref()
+            .and_then(|cached| cached.find(uid).cloned()))
+    }
+
+    // Builds the entry for a contact that was just written from the server's
+    // copy of that one record, the same way a full listing would, and puts it
+    // into the cache in place.
+    async fn store_written_entry(
+        &self,
+        token: &str,
+        keys: &ContactsKeys,
+        contact_id: &str,
+    ) -> Result<ContactEntry> {
+        let record = self.client.get_contact(token, contact_id).await?;
+        let entry = record_to_entry(keys, &record)
+            .map_err(|_| BridgeError::Api("contact was not stored".to_string()))?;
+        if let Some(cached) = self.cache.write().await.as_mut() {
+            cached.upsert(entry.clone());
+        }
+        Ok(entry)
     }
 
     pub async fn put(&self, uid: &str, vcard: &str) -> Result<(ContactEntry, bool)> {
@@ -222,6 +284,7 @@ impl ContactsStore {
         }
 
         let _guard = self.write_lock.lock().await;
+        let _refresh = self.refresh_lock.lock().await;
 
         if let Some(body_uid) = super::vcard::extract_uid(vcard) {
             if body_uid != uid {
@@ -234,12 +297,12 @@ impl ContactsStore {
 
         let keys = self.keys().await?;
         let token = self.access_token().await;
-        let existing = self.list().await?.into_iter().find(|e| e.uid == uid);
+        let existing = self.current_entry_locked(uid).await?;
 
         let sealed = keys.encrypt_data(&Value::Object(payload.clone()))?;
         let tokens = search_tokens(&keys, &payload);
 
-        let created = match &existing {
+        let (contact_id, created) = match &existing {
             Some(entry) => {
                 self.client
                     .update_contact(
@@ -255,10 +318,11 @@ impl ContactsStore {
                         },
                     )
                     .await?;
-                false
+                (entry.contact_id.clone(), false)
             }
             None => {
-                self.client
+                let response = self
+                    .client
                     .create_contact(
                         &token,
                         &CreateContactRequest {
@@ -273,35 +337,86 @@ impl ContactsStore {
                         },
                     )
                     .await?;
-                true
+                (response.id, true)
             }
         };
 
-        self.invalidate().await;
-
-        let entry = self
-            .list()
-            .await?
-            .into_iter()
-            .find(|e| e.uid == uid)
-            .ok_or_else(|| BridgeError::Api("contact was not stored".to_string()))?;
+        let entry = match self.store_written_entry(&token, &keys, &contact_id).await {
+            Ok(entry) if entry.uid == uid => entry,
+            _ => {
+                self.refresh_locked().await?;
+                self.cache
+                    .read()
+                    .await
+                    .as_ref()
+                    .and_then(|cached| cached.find(uid).cloned())
+                    .ok_or_else(|| BridgeError::Api("contact was not stored".to_string()))?
+            }
+        };
 
         Ok((entry, created))
     }
 
     pub async fn delete(&self, uid: &str) -> Result<bool> {
         let _guard = self.write_lock.lock().await;
+        let _refresh = self.refresh_lock.lock().await;
 
-        let Some(entry) = self.list().await?.into_iter().find(|e| e.uid == uid) else {
+        let Some(entry) = self.current_entry_locked(uid).await? else {
             return Ok(false);
         };
 
         let token = self.access_token().await;
         self.client.delete_contact(&token, &entry.contact_id).await?;
-        self.invalidate().await;
+        if let Some(cached) = self.cache.write().await.as_mut() {
+            cached.remove(uid);
+        }
 
         Ok(true)
     }
+}
+
+enum RecordSkip {
+    Integrity,
+    Decrypt,
+}
+
+fn record_to_entry(
+    keys: &ContactsKeys,
+    record: &ContactRecord,
+) -> std::result::Result<ContactEntry, RecordSkip> {
+    if let (Some(hash), Some(version)) = (record.integrity_hash.as_deref(), record.data_version) {
+        if !keys.verify_integrity_hash(&record.encrypted_data, &record.data_nonce, version, hash) {
+            tracing::debug!(
+                "contact {} failed its integrity check and was skipped",
+                record.id
+            );
+            return Err(RecordSkip::Integrity);
+        }
+    }
+
+    let payload = match keys.decrypt_data(&record.encrypted_data, &record.data_nonce) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::debug!("contact {} could not be decrypted: {}", record.id, e);
+            return Err(RecordSkip::Decrypt);
+        }
+    };
+
+    let uid = payload
+        .get(DAV_UID_FIELD)
+        .and_then(|v| v.as_str())
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty() && is_safe_uid(v))
+        .unwrap_or(record.id.as_str())
+        .to_string();
+
+    let vcard = super::vcard::contact_to_vcard(&uid, &payload, &record.updated_at);
+    Ok(ContactEntry {
+        uid,
+        contact_id: record.id.clone(),
+        etag: entry_etag(&vcard),
+        vcard,
+    })
 }
 
 struct SearchTokens {
